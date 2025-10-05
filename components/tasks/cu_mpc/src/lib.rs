@@ -6,9 +6,9 @@ use cu29::prelude::*;
 use serde::Serialize;
 use std::marker::PhantomData;
 
-/// Output of the PID controller.
+/// Output of the MPC controller.
 #[derive(Debug, Default, Clone, Encode, Decode, Serialize)]
-pub struct PIDControlOutputPayload {
+pub struct MPCControlOutputPayload {
     /// Proportional term
     pub p: f32,
     /// Integral term
@@ -19,8 +19,8 @@ pub struct PIDControlOutputPayload {
     pub output: f32,
 }
 
-/// This is the underlying standard PID controller.
-pub struct PIDController {
+/// This is the underlying standard MPC controller.
+pub struct MPCController {
     // Configuration
     kp: f32,
     ki: f32,
@@ -35,10 +35,10 @@ pub struct PIDController {
     integral: f32,
     last_error: f32,
     elapsed: CuDuration,
-    last_output: PIDControlOutputPayload,
+    last_output: MPCControlOutputPayload,
 }
 
-impl PIDController {
+impl MPCController {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kp: f32,
@@ -51,7 +51,7 @@ impl PIDController {
         output_limit: f32,
         sampling: CuDuration, // to avoid oversampling and get a bunch of zeros.
     ) -> Self {
-        PIDController {
+        MPCController {
             kp,
             ki,
             kd,
@@ -64,7 +64,7 @@ impl PIDController {
             output_limit,
             elapsed: CuDuration::default(),
             sampling,
-            last_output: PIDControlOutputPayload::default(),
+            last_output: MPCControlOutputPayload::default(),
         }
     }
 
@@ -82,11 +82,11 @@ impl PIDController {
         &mut self,
         measurement: f32,
         dt: CuDuration,
-    ) -> PIDControlOutputPayload {
+    ) -> MPCControlOutputPayload {
         self.elapsed += dt;
 
         if self.elapsed < self.sampling {
-            // if we bang too fast the PID controller, just keep on giving the same answer
+            // if we update the MPC controller too fast, return its previous output
             return self.last_output.clone();
         }
 
@@ -115,7 +115,7 @@ impl PIDController {
         let output_unbounded = p + i + d;
         let output = output_unbounded.clamp(-self.output_limit, self.output_limit);
 
-        let output = PIDControlOutputPayload { p, i, d, output };
+        let output = MPCControlOutputPayload { p, i, d, output };
 
         self.last_output = output.clone();
         self.elapsed = CuDuration::default();
@@ -123,26 +123,26 @@ impl PIDController {
     }
 }
 
-/// This is the Copper task encapsulating the PID controller.
-pub struct GenericPIDTask<I>
+/// This is the Copper task encapsulating the MPC controller.
+pub struct GenericMPCTask<I>
 where
     f32: for<'a> From<&'a I>,
 {
     _marker: PhantomData<I>,
-    pid: PIDController,
+    mpc: MPCController,
     first_run: bool,
     last_tov: CuTime,
     setpoint: f32,
     cutoff: f32,
 }
 
-impl<I> CuTask for GenericPIDTask<I>
+impl<I> CuTask for GenericMPCTask<I>
 where
     f32: for<'a> From<&'a I>,
     I: CuMsgPayload,
 {
     type Input<'m> = input_msg!(I);
-    type Output<'m> = output_msg!(PIDControlOutputPayload);
+    type Output<'m> = output_msg!(MPCControlOutputPayload);
 
     fn new(config: Option<&ComponentConfig>) -> CuResult<Self>
     where
@@ -150,7 +150,7 @@ where
     {
         match config {
             Some(config) => {
-                debug!("PIDTask config: {:?}", config);
+                debug!("MPCTask config: {:?}", config);
                 let setpoint: f32 = config
                     .get::<f64>("setpoint")
                     .ok_or("'setpoint' not found in config")?
@@ -165,7 +165,7 @@ where
                     Ok(kp as f32)
                 } else {
                     Err(CuError::from(
-                        "'kp' not found in the config. We need at least 'kp' to make the PID algorithm work.",
+                        "'kp' not found in the config. We need at least 'kp' to make the MPC algorithm work.",
                     ))
                 }?;
 
@@ -182,7 +182,7 @@ where
                     CuDuration::default()
                 };
 
-                let pid: PIDController = PIDController::new(
+                let mpc: MPCController = MPCController::new(
                     kp,
                     ki,
                     kd,
@@ -196,14 +196,14 @@ where
 
                 Ok(Self {
                     _marker: PhantomData,
-                    pid,
+                    mpc,
                     first_run: true,
                     last_tov: CuTime::default(),
                     setpoint,
                     cutoff,
                 })
             }
-            None => Err(CuError::from("PIDTask needs a config.")),
+            None => Err(CuError::from("MPCTask needs a config.")),
         }
     }
 
@@ -217,7 +217,7 @@ where
             Some(payload) => {
                 let tov = match input.tov {
                     Tov::Time(single) => single,
-                    _ => return Err("Unexpected variant for a TOV of PID".into()),
+                    _ => return Err("Unexpected variant for a TOV of MPC".into()),
                 };
 
                 let measure: f32 = payload.into();
@@ -225,15 +225,15 @@ where
                 if self.first_run {
                     self.first_run = false;
                     self.last_tov = tov;
-                    self.pid.init_measurement(measure);
+                    self.mpc.init_measurement(measure);
                     output.clear_payload();
                     return Ok(());
                 }
                 let dt = tov - self.last_tov;
                 self.last_tov = tov;
 
-                // update the status of the pid.
-                let state = self.pid.next_control_output(measure, dt);
+                // update the status of the MPC controller.
+                let state = self.mpc.next_control_output(measure, dt);
                 // But safety check if the input is within operational margins and cut power if it is not.
                 if measure > self.setpoint + self.cutoff {
                     return Err(
@@ -257,30 +257,30 @@ where
     }
 
     fn stop(&mut self, _clock: &RobotClock) -> CuResult<()> {
-        self.pid.reset();
+        self.mpc.reset();
         self.first_run = true;
         Ok(())
     }
 }
 
-/// Store/Restore the internal state of the PID controller.
-impl<I> Freezable for GenericPIDTask<I>
+/// Store/Restore the internal state of the MPC controller.
+impl<I> Freezable for GenericMPCTask<I>
 where
     f32: for<'a> From<&'a I>,
 {
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        Encode::encode(&self.pid.integral, encoder)?;
-        Encode::encode(&self.pid.last_error, encoder)?;
-        Encode::encode(&self.pid.elapsed, encoder)?;
-        Encode::encode(&self.pid.last_output, encoder)?;
+        Encode::encode(&self.mpc.integral, encoder)?;
+        Encode::encode(&self.mpc.last_error, encoder)?;
+        Encode::encode(&self.mpc.elapsed, encoder)?;
+        Encode::encode(&self.mpc.last_output, encoder)?;
         Ok(())
     }
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
-        self.pid.integral = Decode::decode(decoder)?;
-        self.pid.last_error = Decode::decode(decoder)?;
-        self.pid.elapsed = Decode::decode(decoder)?;
-        self.pid.last_output = Decode::decode(decoder)?;
+        self.mpc.integral = Decode::decode(decoder)?;
+        self.mpc.last_error = Decode::decode(decoder)?;
+        self.mpc.elapsed = Decode::decode(decoder)?;
+        self.mpc.last_output = Decode::decode(decoder)?;
         Ok(())
     }
 }
