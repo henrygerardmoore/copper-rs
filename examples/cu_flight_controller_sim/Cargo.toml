@@ -1,0 +1,22 @@
+[package]
+name = "cu_flight_controller_sim"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+bevy_multicopter = { git = "https://github.com/henrygerardmoore/bevy_multicopter", rev="089bd3867eb712ab9e0f9325289fa94c921becf3" }
+avian3d = "0.4"
+bevy = "0.17.3"
+cu29 = { workspace = true }
+cu29-helpers = { workspace = true }
+serde = { workspace = true }
+cu-consolemon = { path = "../../components/monitors/cu_consolemon", version = "0.12.0" }
+cu-pid = { path = "../../components/tasks/cu_pid", version = "0.12.0" }
+bincode = { workspace = true }
+cu-sensor-payloads = { path = "../../components/payloads/cu_sensor_payloads", version = "0.12.0", default-features = false }
